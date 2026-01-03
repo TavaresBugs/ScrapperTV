@@ -1,0 +1,39 @@
+{
+  "name": "tradingview-scraper",
+  "version": "1.0.0",
+  "description": "TradingView data scraper for replay system",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "cli": "tsx src/cli.ts",
+    "convert": "tsx src/converter.ts",
+    "scraper": "tsx src/playwright-scraper.ts",
+    "auto": "tsx src/auto-scraper.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "tradingview",
+    "websocket",
+    "scraper",
+    "candles",
+    "replay"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "playwright": "^1.57.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
