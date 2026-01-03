@@ -262,7 +262,8 @@ function groupByMonth(candles: Candle[]): Map<string, Candle[]> {
 }
 
 /**
- * Salva arquivo único (para Mensal, Semanal, Diario)
+ * Salva arquivo único em pasta (para Mensal, Semanal, Diario)
+ * Estrutura: TF/index.json + TF/all.json
  */
 async function saveSingleFile(
   candles: Candle[],
@@ -270,19 +271,32 @@ async function saveSingleFile(
   timeframe: string,
   outputDir: string
 ): Promise<void> {
-  const data: SingleFileData = {
+  const tfDir = join(outputDir, timeframe);
+  await mkdir(tfDir, { recursive: true });
+  
+  // Salvar all.json (só candles)
+  await writeFile(join(tfDir, 'all.json'), JSON.stringify(candles, null, 2));
+  
+  // Salvar index.json (metadados)
+  const index: ChunkIndex = {
     symbol,
     timeframe,
     updatedAt: new Date().toISOString(),
     totalCandles: candles.length,
     firstCandle: formatDateISO(candles[0].timestamp),
     lastCandle: formatDateISO(candles[candles.length - 1].timestamp),
-    candles,
+    chunks: [{
+      file: 'all.json',
+      startDate: formatDateISO(candles[0].timestamp),
+      endDate: formatDateISO(candles[candles.length - 1].timestamp),
+      startTimestamp: candles[0].timestamp,
+      endTimestamp: candles[candles.length - 1].timestamp,
+      count: candles.length,
+    }],
   };
   
-  const outPath = join(outputDir, `${timeframe}.json`);
-  await writeFile(outPath, JSON.stringify(data, null, 2));
-  console.log(`  ✅ ${timeframe}.json: ${candles.length} candles`);
+  await writeFile(join(tfDir, 'index.json'), JSON.stringify(index, null, 2));
+  console.log(`  ✅ ${timeframe}/: ${candles.length} candles`);
 }
 
 /**
