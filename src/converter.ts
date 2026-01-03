@@ -1,11 +1,26 @@
 #!/usr/bin/env node
 /**
- * Conversor de CSV para JSON chunked
+ * Conversor de CSV para JSON
  * 
- * Lê arquivos CSV raw e converte para estrutura
- * otimizada para o sistema de replay
+ * Estrutura de saída:
+ * data/SYMBOL/
+ * ├── Mensal.json       # Arquivo único
+ * ├── Semanal.json      # Arquivo único
+ * ├── Diario.json       # Arquivo único
+ * ├── 4H/               # Por ano
+ * │   ├── index.json
+ * │   └── 2024.json
+ * ├── 1H/               # Por ano
+ * │   ├── index.json
+ * │   └── 2024.json
+ * ├── 15M/              # Por mês
+ * │   ├── index.json
+ * │   └── 2024/01.json
+ * ├── 5M/               # Por mês
+ * ├── 3M/               # Por mês
+ * └── 1M/               # Por mês
  */
-import { readFile, writeFile, mkdir, readdir } from 'fs/promises';
+import { readFile, writeFile, mkdir, readdir, rm } from 'fs/promises';
 import { join, basename, dirname } from 'path';
 import { existsSync } from 'fs';
 import type { Candle } from './types.js';
@@ -29,65 +44,124 @@ interface ChunkInfo {
   count: number;
 }
 
-// Configuração de chunking por timeframe
-const CHUNK_CONFIG: Record<string, { by: 'year' | 'month' | 'week' | 'single'; maxCandles: number }> = {
-  // Arquivos Únicos
-  '1M': { by: 'single', maxCandles: Infinity },
-  '1W': { by: 'single', maxCandles: Infinity },
-  '1D': { by: 'single', maxCandles: Infinity },
-  
-  // Por ANO (Mid/Low timeframe 15min - 4H)
-  '4H': { by: 'year', maxCandles: Infinity },
-  '240': { by: 'year', maxCandles: Infinity },
-  '1H': { by: 'year', maxCandles: Infinity },
-  '60': { by: 'year', maxCandles: Infinity },
-  '30min': { by: 'year', maxCandles: Infinity },
-  '30': { by: 'year', maxCandles: Infinity },
-  '15min': { by: 'year', maxCandles: Infinity }, 
-  '15': { by: 'year', maxCandles: Infinity },
+interface SingleFileData {
+  symbol: string;
+  timeframe: string;
+  updatedAt: string;
+  totalCandles: number;
+  firstCandle: string;
+  lastCandle: string;
+  candles: Candle[];
+}
 
-  // Por MÊS (High timeframe <= 5min)
-  '5min': { by: 'month', maxCandles: Infinity },
-  '5': { by: 'month', maxCandles: Infinity },
-  '3min': { by: 'month', maxCandles: Infinity },
-  '3': { by: 'month', maxCandles: Infinity }, 
-  '1min': { by: 'month', maxCandles: Infinity },
-  '1': { by: 'month', maxCandles: Infinity },
+// Estratégia de chunking por timeframe normalizado
+type ChunkStrategy = 'single' | 'year' | 'month';
+
+const CHUNK_STRATEGY: Record<string, ChunkStrategy> = {
+  // Arquivos únicos (HTF)
+  'Mensal': 'single',
+  'Semanal': 'single',
+  'Diario': 'single',
+  
+  // Por ano (MTF)
+  '4H': 'year',
+  '1H': 'year',
+  '30M': 'year',
+  '15M': 'year',
+  
+  // Por mês (LTF - muitos candles)
+  '5M': 'month',
+  '3M': 'month',
+  '1M': 'month',
 };
 
 // Mapa de aliases para normalizar nomes de timeframes
-// Nomenclatura: Mensal, Semanal, Diario, 4H, 1H, 15M, 5M, 3M, 1M
 const TIMEFRAME_ALIASES: Record<string, string> = {
-  // Timeframes maiores
-  '1M': 'Mensal',
+  // HTF
   'M': 'Mensal',
+  '1M': 'Mensal', // Cuidado: 1M também pode ser 1 minuto
   'Mensal': 'Mensal',
-  '1W': 'Semanal',
   'W': 'Semanal',
+  '1W': 'Semanal',
   'Semanal': 'Semanal',
-  '1D': 'Diario',
   'D': 'Diario',
+  '1D': 'Diario',
   'Diario': 'Diario',
-  // Timeframes intraday
+  
+  // MTF
   '240': '4H',
   '4H': '4H',
   '60': '1H',
   '1H': '1H',
   '30': '30M',
   '30min': '30M',
+  '30M': '30M',
   '15': '15M',
   '15min': '15M',
+  '15M': '15M',
+  
+  // LTF
   '5': '5M',
   '5min': '5M',
+  '5M': '5M',
   '3': '3M',
   '3min': '3M',
-  '1': '1M',
-  '1min': '1M',
+  '3M': '3M',
+  '1': '1min', // 1 minuto, não mensal
+  '1min': '1min',
 };
 
 /**
- * Normaliza o nome do timeframe para um formato canônico
- * Ex: 60 -> 1H, 240 -> 4H
+ * Detecta timeframe a partir do nome do arquivo
+ */
+function detectTimeframe(filename: string): string | null {
+  // Prioridade: timeframes mais específicos primeiro
+  const patterns: [RegExp, string][] = [
+    // HTF - nomes em português
+    [/Mensal/i, 'Mensal'],
+    [/Semanal/i, 'Semanal'],
+    [/Diario/i, 'Diario'],
+    
+    // MTF - formato _TF_ ou _TF.csv
+    [/_4H[_.]/, '4H'],
+    [/_1H[_.]/, '1H'],
+    [/_30M?[_.]/, '30M'],
+    [/_15M?[_.]/, '15M'],
+    
+    // LTF
+    [/_5M?[_.]/, '5M'],
+    [/_3M?[_.]/, '3M'],
+    [/_1[_.]/, '1min'], // 1 minuto
+    
+    // Fallback: número no nome (ex: CME_..._1_2023-05-16 = 1 minuto)
+    [/_(\d+)_\d{4}-/, null], // Captura grupo
+  ];
+  
+  for (const [pattern, tf] of patterns) {
+    if (pattern.test(filename)) {
+      if (tf === null) {
+        // Extrair número do padrão
+        const match = filename.match(/_(\d+)_\d{4}-/);
+        if (match) {
+          const num = match[1];
+          if (num === '1') return '1min';
+          if (num === '3') return '3M';
+          if (num === '5') return '5M';
+          if (num === '15') return '15M';
+          if (num === '30') return '30M';
+          if (num === '60') return '1H';
+          if (num === '240') return '4H';
+        }
+      }
+      return tf;
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Normaliza o nome do timeframe
  */
 function normalizeTimeframe(tf: string): string {
   return TIMEFRAME_ALIASES[tf] || tf;
@@ -95,74 +169,48 @@ function normalizeTimeframe(tf: string): string {
 
 /**
  * Parse CSV para array de Candles
- * Suporta formatos:
- * 1. Timestamp UNIX (1483398000)
- * 2. ISO String (2025-12-08T13:00...)
- * 3. Híbrido (Timestamp + Datetime)
  */
 function parseCSV(content: string): Candle[] {
   const lines = content.trim().split('\n');
   const header = lines[0].toLowerCase();
   
-  // Detectar colunas
   const cols = header.split(',');
-  const timeIndex = cols.findIndex(c => c.includes('time')); // 'time' ou 'timestamp'
+  const timeIndex = cols.findIndex(c => c.includes('time'));
   const openIndex = cols.findIndex(c => c.includes('open'));
   const highIndex = cols.findIndex(c => c.includes('high'));
   const lowIndex = cols.findIndex(c => c.includes('low'));
   const closeIndex = cols.findIndex(c => c.includes('close'));
-  const volumeIndex = cols.findIndex(c => c.includes('vol')); // 'volume'
-  
-  // Opcional: datetime explicito
-  const datetimeIndex = cols.findIndex(c => c === 'datetime');
+  const volumeIndex = cols.findIndex(c => c.includes('vol'));
 
   if (timeIndex === -1 || openIndex === -1) {
-      console.error('❌ CSV inválido: Colunas obrigatórias não encontradas');
-      return [];
+    console.error('❌ CSV inválido: Colunas obrigatórias não encontradas');
+    return [];
   }
+
+  const formatDate = (date: Date) => {
+    const pad = (n: number) => n.toString().padStart(2, '0');
+    return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
+  };
 
   return lines.slice(1).map(line => {
     const parts = line.split(',');
-    
-    // 1. Resolver Timestamp e Datetime
-    let timestamp: number;
-    let datetime: string;
-
     const timeRaw = parts[timeIndex];
     
-    // Verifica se col 0 é ISO (contém 'T' ou '-') ou Numérico
+    let timestamp: number;
+    let datetime: string;
+    
     const isIsoString = timeRaw.includes('T') || timeRaw.includes('-');
     
-    // Helper para formatar date (YYYY-MM-DD HH:mm:ss)
-    const formatCustomDate = (date: Date) => {
-        const pad = (n: number) => n.toString().padStart(2, '0');
-        return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
-    };
-
     if (isIsoString) {
-        // Caso: time="2025-12-08T..." ou "2025-12-08 13:00..."
-        const d = new Date(timeRaw);
-        datetime = formatCustomDate(d);
-        timestamp = Math.floor(d.getTime() / 1000);
+      const d = new Date(timeRaw);
+      datetime = formatDate(d);
+      timestamp = Math.floor(d.getTime() / 1000);
     } else {
-        // Caso: time="148393..."
-        timestamp = parseInt(timeRaw);
-        
-        // Se timestamp for ms (13 digitos), normalizar para s (10 digitos) no objeto final
-        // mas usar ms para criar o Date
-        const ms = timestamp > 9999999999 ? timestamp : timestamp * 1000;
-        const d = new Date(ms);
-        
-        if (datetimeIndex !== -1 && parts[datetimeIndex]) {
-            // Se já vier no CSV, tenta usar, mas recomendo padronizar também
-            // Para garantir o formato pedido, vamos ignorar o do CSV e gerar novo
-            // ou formatar o que veio se for parseável. Vamos gerar do timestamp q é seguro.
-            datetime = formatCustomDate(d);
-        } else {
-            datetime = formatCustomDate(d);
-        }
-        
-        if (timestamp > 9999999999) timestamp = Math.floor(timestamp / 1000);
+      timestamp = parseInt(timeRaw);
+      const ms = timestamp > 9999999999 ? timestamp : timestamp * 1000;
+      const d = new Date(ms);
+      datetime = formatDate(d);
+      if (timestamp > 9999999999) timestamp = Math.floor(timestamp / 1000);
     }
 
     return {
@@ -178,227 +226,292 @@ function parseCSV(content: string): Candle[] {
 }
 
 /**
- * Formata timestamp para data
+ * Formata timestamp para data ISO
  */
-function formatDate(timestamp: number): string {
+function formatDateISO(timestamp: number): string {
   return new Date(timestamp * 1000).toISOString().split('T')[0];
 }
 
 /**
- * Obtém chave de chunk baseado no timeframe
+ * Agrupa candles por ano
  */
-function getChunkKey(timestamp: number, chunkBy: 'year' | 'month' | 'week' | 'single'): string {
-  const date = new Date(timestamp * 1000);
-  
-  switch (chunkBy) {
-    case 'single':
-      return 'all';
-    case 'year':
-      return date.getFullYear().toString();
-    case 'month':
-      return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
-    case 'week':
-      const startOfYear = new Date(date.getFullYear(), 0, 1);
-      const days = Math.floor((date.getTime() - startOfYear.getTime()) / (24 * 60 * 60 * 1000));
-      const week = Math.ceil((days + startOfYear.getDay() + 1) / 7);
-      return `${date.getFullYear()}-W${String(week).padStart(2, '0')}`;
-  }
-}
-
-/**
- * Agrupa candles em chunks
- */
-function groupIntoChunks(
-  candles: Candle[],
-  chunkBy: 'year' | 'month' | 'week' | 'single'
-): Map<string, Candle[]> {
-  const chunks = new Map<string, Candle[]>();
-  
+function groupByYear(candles: Candle[]): Map<string, Candle[]> {
+  const groups = new Map<string, Candle[]>();
   for (const candle of candles) {
-    const key = getChunkKey(candle.timestamp, chunkBy);
-    if (!chunks.has(key)) {
-      chunks.set(key, []);
-    }
-    chunks.get(key)!.push(candle);
+    const year = new Date(candle.timestamp * 1000).getFullYear().toString();
+    if (!groups.has(year)) groups.set(year, []);
+    groups.get(year)!.push(candle);
   }
-  
-  return chunks;
+  return groups;
 }
 
 /**
- * Converte CSV para JSON chunked
+ * Agrupa candles por mês (ano/mês)
  */
-async function convertCSV(csvPath: string, outputDir?: string): Promise<void> {
-  console.log(`\n📄 Processando: ${csvPath}`);
+function groupByMonth(candles: Candle[]): Map<string, Candle[]> {
+  const groups = new Map<string, Candle[]>();
+  for (const candle of candles) {
+    const date = new Date(candle.timestamp * 1000);
+    const year = date.getFullYear().toString();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const key = `${year}/${month}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(candle);
+  }
+  return groups;
+}
+
+/**
+ * Salva arquivo único (para Mensal, Semanal, Diario)
+ */
+async function saveSingleFile(
+  candles: Candle[],
+  symbol: string,
+  timeframe: string,
+  outputDir: string
+): Promise<void> {
+  const data: SingleFileData = {
+    symbol,
+    timeframe,
+    updatedAt: new Date().toISOString(),
+    totalCandles: candles.length,
+    firstCandle: formatDateISO(candles[0].timestamp),
+    lastCandle: formatDateISO(candles[candles.length - 1].timestamp),
+    candles,
+  };
   
-  // Ler CSV
+  const outPath = join(outputDir, `${timeframe}.json`);
+  await writeFile(outPath, JSON.stringify(data, null, 2));
+  console.log(`  ✅ ${timeframe}.json: ${candles.length} candles`);
+}
+
+/**
+ * Salva arquivos por ano (para 4H, 1H, 30M, 15M)
+ */
+async function saveByYear(
+  candles: Candle[],
+  symbol: string,
+  timeframe: string,
+  outputDir: string
+): Promise<void> {
+  const tfDir = join(outputDir, timeframe);
+  await mkdir(tfDir, { recursive: true });
+  
+  const groups = groupByYear(candles);
+  const chunkInfos: ChunkInfo[] = [];
+  
+  for (const [year, yearCandles] of groups) {
+    const filename = `${year}.json`;
+    await writeFile(join(tfDir, filename), JSON.stringify(yearCandles, null, 2));
+    
+    chunkInfos.push({
+      file: filename,
+      startDate: formatDateISO(yearCandles[0].timestamp),
+      endDate: formatDateISO(yearCandles[yearCandles.length - 1].timestamp),
+      startTimestamp: yearCandles[0].timestamp,
+      endTimestamp: yearCandles[yearCandles.length - 1].timestamp,
+      count: yearCandles.length,
+    });
+    
+    console.log(`    📁 ${filename}: ${yearCandles.length} candles`);
+  }
+  
+  // Ordenar e salvar índice
+  chunkInfos.sort((a, b) => a.startTimestamp - b.startTimestamp);
+  
+  const index: ChunkIndex = {
+    symbol,
+    timeframe,
+    updatedAt: new Date().toISOString(),
+    totalCandles: candles.length,
+    firstCandle: formatDateISO(candles[0].timestamp),
+    lastCandle: formatDateISO(candles[candles.length - 1].timestamp),
+    chunks: chunkInfos,
+  };
+  
+  await writeFile(join(tfDir, 'index.json'), JSON.stringify(index, null, 2));
+  console.log(`  ✅ ${timeframe}/: ${groups.size} anos, ${candles.length} candles total`);
+}
+
+/**
+ * Salva arquivos por mês (para 5M, 3M, 1M)
+ */
+async function saveByMonth(
+  candles: Candle[],
+  symbol: string,
+  timeframe: string,
+  outputDir: string
+): Promise<void> {
+  const tfDir = join(outputDir, timeframe);
+  await mkdir(tfDir, { recursive: true });
+  
+  const groups = groupByMonth(candles);
+  const chunkInfos: ChunkInfo[] = [];
+  
+  for (const [yearMonth, monthCandles] of groups) {
+    const [year, month] = yearMonth.split('/');
+    const yearDir = join(tfDir, year);
+    await mkdir(yearDir, { recursive: true });
+    
+    const filename = `${year}/${month}.json`;
+    await writeFile(join(yearDir, `${month}.json`), JSON.stringify(monthCandles, null, 2));
+    
+    chunkInfos.push({
+      file: filename,
+      startDate: formatDateISO(monthCandles[0].timestamp),
+      endDate: formatDateISO(monthCandles[monthCandles.length - 1].timestamp),
+      startTimestamp: monthCandles[0].timestamp,
+      endTimestamp: monthCandles[monthCandles.length - 1].timestamp,
+      count: monthCandles.length,
+    });
+  }
+  
+  // Ordenar e salvar índice
+  chunkInfos.sort((a, b) => a.startTimestamp - b.startTimestamp);
+  
+  const index: ChunkIndex = {
+    symbol,
+    timeframe,
+    updatedAt: new Date().toISOString(),
+    totalCandles: candles.length,
+    firstCandle: formatDateISO(candles[0].timestamp),
+    lastCandle: formatDateISO(candles[candles.length - 1].timestamp),
+    chunks: chunkInfos,
+  };
+  
+  await writeFile(join(tfDir, 'index.json'), JSON.stringify(index, null, 2));
+  console.log(`  ✅ ${timeframe}/: ${groups.size} meses, ${candles.length} candles total`);
+}
+
+/**
+ * Converte um arquivo CSV
+ */
+async function convertCSV(csvPath: string, outputDir: string): Promise<void> {
+  const filename = basename(csvPath, '.csv');
+  const timeframe = detectTimeframe(filename);
+  
+  if (!timeframe) {
+    console.log(`  ⚠️ Timeframe não detectado: ${filename}`);
+    return;
+  }
+  
+  const normalizedTf = normalizeTimeframe(timeframe);
+  const strategy = CHUNK_STRATEGY[normalizedTf] || 'month';
+  
+  console.log(`  📄 ${filename} → ${normalizedTf} (${strategy})`);
+  
   const content = await readFile(csvPath, 'utf-8');
   const candles = parseCSV(content);
   
   if (candles.length === 0) {
-    console.log('⚠️ Nenhum candle encontrado no arquivo');
+    console.log(`    ⚠️ Nenhum candle encontrado`);
     return;
   }
   
-  // Ordenar por timestamp
   candles.sort((a, b) => a.timestamp - b.timestamp);
   
-  // Extrair informações do path
-  const filename = basename(csvPath, '.csv');
   const symbol = basename(dirname(csvPath));
   
-  // Tentar detectar timeframe no nome do arquivo (ex: NQ1!_1H_2019...)
-  // Procura por chaves do config dentro do nome
-  let timeframe = filename;
-  const knownTimeframes = Object.keys(CHUNK_CONFIG);
-  
-  // Ordena por tamanho para evitar falsos positivos (ex: '15' matching '15min')
-  knownTimeframes.sort((a, b) => b.length - a.length);
-  
-  const detectedTf = knownTimeframes.find(tf => {
-      // Verifica se o timeframe está no nome, cercado por _ ou inicio/fim
-      // Ex: _1H_ ou _1H ou 1H_
-      return filename.includes(`_${tf}_`) || filename.endsWith(`_${tf}`) || filename.startsWith(`${tf}_`);
-  });
-
-  if (detectedTf) {
-      timeframe = detectedTf;
+  switch (strategy) {
+    case 'single':
+      await saveSingleFile(candles, symbol, normalizedTf, outputDir);
+      break;
+    case 'year':
+      await saveByYear(candles, symbol, normalizedTf, outputDir);
+      break;
+    case 'month':
+      await saveByMonth(candles, symbol, normalizedTf, outputDir);
+      break;
   }
-  
-  // Determinar configuração de chunking
-  const config = CHUNK_CONFIG[timeframe] || { by: 'month' as const, maxCandles: 5000 };
-  
-  // Normalizar timeframe para nome canônico (60 -> 1H, etc)
-  const normalizedTimeframe = normalizeTimeframe(timeframe);
-  
-  // Definir diretório de saída
-  // Se outputDir for fornecido, usa ele como base. Se não, usa o diretório do CSV.
-  // Estrutura desejada: .../1H/2019.json (sem sufixo _json chato)
-  const baseDir = outputDir || dirname(csvPath);
-  
-  // Se estamos salvando na mesma pasta do raw, talvez criar uma subpasta 'json' seja bom?
-  // Mas o usuário sugeriu: "usar apenas dentro do 1H ja em modo Json"
-  // Vamos criar uma pasta com o nome do Timeframe NORMALIZADO.
-  // Ex: se estamos em data/raw/Symbol/, cria data/raw/Symbol/1H/ (não 60/)
-  const jsonDir = join(baseDir, normalizedTimeframe);
-  
-  await mkdir(jsonDir, { recursive: true });
-  
-  console.log(`📊 ${candles.length} candles encontrados`);
-  console.log(`📅 Período: ${formatDate(candles[0].timestamp)} → ${formatDate(candles[candles.length - 1].timestamp)}`);
-  console.log(`📦 Estratégia de chunking: ${config.by}`);
-  
-  if (config.by === 'single') {
-    // Arquivo único
-    const outPath = join(jsonDir, `${timeframe}.json`);
-    await writeFile(outPath, JSON.stringify({
-      symbol,
-      timeframe,
-      count: candles.length,
-      firstDate: formatDate(candles[0].timestamp),
-      lastDate: formatDate(candles[candles.length - 1].timestamp),
-      candles,
-    }, null, 2));
-    console.log(`✅ Salvo: ${outPath}`);
-    return;
-  }
-  
-  // Agrupar em chunks
-  const chunks = groupIntoChunks(candles, config.by);
-  const chunkInfos: ChunkInfo[] = [];
-  
-  // Salvar cada chunk
-  for (const [key, chunkCandles] of chunks) {
-    let chunkFilename: string;
-    let chunkPath: string;
-    
-    // Para chunks mensais, criar estrutura ano/mes.json
-    if (config.by === 'month' && key.includes('-')) {
-      const [year, month] = key.split('-');
-      const yearDir = join(jsonDir, year);
-      await mkdir(yearDir, { recursive: true });
-      chunkFilename = `${year}/${month}.json`;
-      chunkPath = join(yearDir, `${month}.json`);
-    } else {
-      chunkFilename = `${key}.json`;
-      chunkPath = join(jsonDir, chunkFilename);
-    }
-    
-    // Formatar JSON com indentação para legibilidade
-    await writeFile(chunkPath, JSON.stringify(chunkCandles, null, 2));
-    
-    chunkInfos.push({
-      file: chunkFilename,
-      startDate: formatDate(chunkCandles[0].timestamp),
-      endDate: formatDate(chunkCandles[chunkCandles.length - 1].timestamp),
-      startTimestamp: chunkCandles[0].timestamp,
-      endTimestamp: chunkCandles[chunkCandles.length - 1].timestamp,
-      count: chunkCandles.length,
-    });
-    
-    console.log(`  📁 ${chunkFilename}: ${chunkCandles.length} candles`);
-  }
-  
-  // Ordenar chunks por data
-  chunkInfos.sort((a, b) => a.startTimestamp - b.startTimestamp);
-  
-  // Ler index existente (se houver) para mesclar novos chunks
-  const indexPath = join(jsonDir, 'index.json');
-  let existingChunks: ChunkInfo[] = [];
-  
-  if (existsSync(indexPath)) {
-    try {
-      const existingIndex = JSON.parse(await readFile(indexPath, 'utf-8')) as ChunkIndex;
-      existingChunks = existingIndex.chunks || [];
-    } catch {}
-  }
-  
-  // Mesclar: combinar chunks existentes com novos (evitar duplicatas por nome de arquivo)
-  const allChunksMap = new Map<string, ChunkInfo>();
-  for (const chunk of existingChunks) {
-    allChunksMap.set(chunk.file, chunk);
-  }
-  for (const chunk of chunkInfos) {
-    allChunksMap.set(chunk.file, chunk); // Sobrescreve se já existir
-  }
-  
-  const allChunks = Array.from(allChunksMap.values()).sort((a, b) => a.startTimestamp - b.startTimestamp);
-  
-  // Calcular totais do índice mesclado
-  const allCandles = allChunks.reduce((sum, c) => sum + c.count, 0);
-  const firstChunk = allChunks[0];
-  const lastChunk = allChunks[allChunks.length - 1];
-  
-  // Criar índice atualizado
-  const index: ChunkIndex = {
-    symbol,
-    timeframe: normalizedTimeframe,
-    updatedAt: new Date().toISOString(),
-    totalCandles: allCandles,
-    firstCandle: firstChunk.startDate,
-    lastCandle: lastChunk.endDate,
-    chunks: allChunks,
-  };
-  
-  await writeFile(indexPath, JSON.stringify(index, null, 2));
-  
-  console.log(`\n✅ Convertido! ${chunks.size} chunks criados em ${jsonDir} (total: ${allChunks.length} chunks)`);
 }
 
 /**
- * Converte todos os CSVs de um diretório
+ * Processa todos os CSVs de um diretório de símbolo
  */
-async function convertAll(dir: string): Promise<void> {
-  const entries = await readdir(dir, { withFileTypes: true });
+async function processSymbolDir(symbolDir: string): Promise<void> {
+  const symbol = basename(symbolDir);
+  console.log(`\n📊 Processando ${symbol}...`);
+  
+  // Listar todos os CSVs
+  const entries = await readdir(symbolDir, { withFileTypes: true });
+  const csvFiles = entries.filter(e => e.isFile() && e.name.endsWith('.csv'));
+  
+  if (csvFiles.length === 0) {
+    console.log('  ⚠️ Nenhum CSV encontrado');
+    return;
+  }
+  
+  // Agrupar CSVs por timeframe detectado
+  const byTimeframe = new Map<string, string[]>();
+  
+  for (const csv of csvFiles) {
+    const tf = detectTimeframe(csv.name);
+    if (!tf) continue;
+    
+    const normalizedTf = normalizeTimeframe(tf);
+    if (!byTimeframe.has(normalizedTf)) byTimeframe.set(normalizedTf, []);
+    byTimeframe.get(normalizedTf)!.push(join(symbolDir, csv.name));
+  }
+  
+  // Processar cada timeframe (mesclando múltiplos CSVs do mesmo TF)
+  for (const [tf, files] of byTimeframe) {
+    console.log(`\n  🕐 ${tf}: ${files.length} arquivo(s)`);
+    
+    // Ler e mesclar todos os candles
+    let allCandles: Candle[] = [];
+    
+    for (const file of files) {
+      const content = await readFile(file, 'utf-8');
+      const candles = parseCSV(content);
+      allCandles = allCandles.concat(candles);
+    }
+    
+    if (allCandles.length === 0) continue;
+    
+    // Remover duplicatas (por timestamp)
+    const uniqueMap = new Map<number, Candle>();
+    for (const c of allCandles) {
+      uniqueMap.set(c.timestamp, c);
+    }
+    allCandles = Array.from(uniqueMap.values());
+    
+    // Ordenar
+    allCandles.sort((a, b) => a.timestamp - b.timestamp);
+    
+    console.log(`    📈 ${allCandles.length} candles únicos (${formatDateISO(allCandles[0].timestamp)} → ${formatDateISO(allCandles[allCandles.length - 1].timestamp)})`);
+    
+    // Salvar conforme estratégia
+    const strategy = CHUNK_STRATEGY[tf] || 'month';
+    
+    switch (strategy) {
+      case 'single':
+        await saveSingleFile(allCandles, symbol, tf, symbolDir);
+        break;
+      case 'year':
+        await saveByYear(allCandles, symbol, tf, symbolDir);
+        break;
+      case 'month':
+        await saveByMonth(allCandles, symbol, tf, symbolDir);
+        break;
+    }
+  }
+}
+
+/**
+ * Limpa estrutura antiga (pastas de TF fragmentadas)
+ */
+async function cleanOldStructure(symbolDir: string): Promise<void> {
+  const entries = await readdir(symbolDir, { withFileTypes: true });
   
   for (const entry of entries) {
-    const fullPath = join(dir, entry.name);
-    
     if (entry.isDirectory()) {
-      // Recursivamente processar subdiretórios
-      await convertAll(fullPath);
-    } else if (entry.name.endsWith('.csv')) {
-      await convertCSV(fullPath);
+      const dirPath = join(symbolDir, entry.name);
+      
+      // Remover pastas antigas de TF que agora são arquivos únicos
+      if (['Mensal', 'Semanal', 'Diario'].includes(entry.name)) {
+        console.log(`  🗑️ Removendo pasta antiga: ${entry.name}/`);
+        await rm(dirPath, { recursive: true, force: true });
+      }
     }
   }
 }
@@ -410,24 +523,34 @@ async function main() {
   if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
     console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
-║         CSV to JSON Converter - Para Sistema de Replay        ║
+║              CSV → JSON Converter v2.0                        ║
 ╚═══════════════════════════════════════════════════════════════╝
 
 USAGE:
   npm run convert -- <caminho>
 
 EXEMPLOS:
-  # Converter um arquivo específico
-  npm run convert -- ./data/MNQ/5min.csv
+  # Converter todos os CSVs de um símbolo
+  npm run convert -- ./data/raw/CME_MINI_DL_NQ1
 
-  # Converter todos os CSVs de um diretório
-  npm run convert -- ./data
+  # Converter todos os símbolos em data/raw
+  npm run convert -- ./data/raw
 
-ESTRATÉGIA DE CHUNKING:
-  Mensal/Semanal/Diário → Arquivo único
-  4H                    → Por ano
-  1H/30min              → Por mês
-  15min/5min/1min       → Por semana
+ESTRUTURA DE SAÍDA:
+  data/SYMBOL/
+  ├── Mensal.json       # Arquivo único
+  ├── Semanal.json      # Arquivo único  
+  ├── Diario.json       # Arquivo único
+  ├── 4H/               # Por ano
+  │   ├── index.json
+  │   └── 2024.json
+  ├── 1H/               # Por ano
+  ├── 15M/              # Por mês
+  │   ├── index.json
+  │   └── 2024/01.json
+  ├── 5M/               # Por mês
+  ├── 3M/               # Por mês
+  └── 1M/               # Por mês
 `);
     return;
   }
@@ -441,14 +564,32 @@ ESTRATÉGIA DE CHUNKING:
   
   console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
-║         CSV to JSON Converter - Para Sistema de Replay        ║
+║              CSV → JSON Converter v2.0                        ║
 ╚═══════════════════════════════════════════════════════════════╝
 `);
   
-  if (path.endsWith('.csv')) {
-    await convertCSV(path);
+  // Verificar se é diretório de símbolo ou diretório pai
+  const entries = await readdir(path, { withFileTypes: true });
+  const hasCsvFiles = entries.some(e => e.isFile() && e.name.endsWith('.csv'));
+  
+  if (hasCsvFiles) {
+    // É um diretório de símbolo
+    await cleanOldStructure(path);
+    await processSymbolDir(path);
   } else {
-    await convertAll(path);
+    // É diretório pai - processar cada subdiretório
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        const symbolDir = join(path, entry.name);
+        const subEntries = await readdir(symbolDir, { withFileTypes: true });
+        const subHasCsv = subEntries.some(e => e.isFile() && e.name.endsWith('.csv'));
+        
+        if (subHasCsv) {
+          await cleanOldStructure(symbolDir);
+          await processSymbolDir(symbolDir);
+        }
+      }
+    }
   }
   
   console.log('\n🎉 Conversão completa!\n');
