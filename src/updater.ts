@@ -1,27 +1,45 @@
 #!/usr/bin/env node
 /**
- * Updater Script
+ * Updater Script - Estrutura Hierárquica
  * 
- * Baixa dados atualizados do TradingView e atualiza arquivos no Google Drive.
- * Usado pelo GitHub Actions para atualizações automáticas.
+ * Estrutura no Drive:
+ * data/
+ * └── CME_MINI_DL_NQ1/
+ *     ├── Mensal.json         # UM arquivo
+ *     ├── Semanal.json        # UM arquivo
+ *     ├── Diario.json         # UM arquivo
+ *     ├── 4H/
+ *     │   └── index.json + por ano (2024.json, 2025.json)
+ *     ├── 1H/
+ *     │   └── index.json + por ano
+ *     ├── 15M/
+ *     │   └── ano/mes.json (2025/01.json)
+ *     ├── 5M/
+ *     │   └── ano/mes.json
+ *     └── 1M/
+ *         └── ano/mes.json
  */
 import { connect, getCandles, type Candle, type Timeframe } from './index.js';
-import { listFiles, downloadJson, uploadJson, findOrCreateFolder } from './drive.js';
-import { readFile, writeFile, mkdir } from 'fs/promises';
-import { join } from 'path';
-import { existsSync } from 'fs';
+import { downloadJson, uploadJson, findOrCreateFolder, findFolder } from './drive.js';
 import 'dotenv/config';
 
 // Configuração
 interface SymbolConfig {
   symbol: string;
+  driveFolderName: string; // Nome da pasta no Drive
+  timeframes: TimeframeConfig[];
+}
+
+interface TimeframeConfig {
+  tf: Timeframe;
   name: string;
-  timeframes: Timeframe[];
+  structure: 'single' | 'yearly' | 'monthly';
 }
 
 interface DataFile {
   symbol: string;
   timeframe: string;
+  period?: string;
   candles: Candle[];
   lastUpdate: string;
   totalCandles: number;
@@ -31,37 +49,19 @@ interface DataFile {
 const SYMBOLS: SymbolConfig[] = [
   {
     symbol: 'CME_MINI:NQ1!',
-    name: 'NQ',
-    timeframes: ['1D', '1W', '1M', 240, 60, 15, 5, 1],
-  },
-  {
-    symbol: 'CME_MINI:ES1!',
-    name: 'ES',
-    timeframes: ['1D', '1W', '1M', 240, 60],
-  },
-  {
-    symbol: 'OANDA:XAUUSD',
-    name: 'GOLD',
-    timeframes: ['1D', '1W', 240, 60],
+    driveFolderName: 'CME_MINI_DL_NQ1',
+    timeframes: [
+      { tf: '1M', name: 'Mensal', structure: 'single' },
+      { tf: '1W', name: 'Semanal', structure: 'single' },
+      { tf: '1D', name: 'Diario', structure: 'single' },
+      { tf: 240, name: '4H', structure: 'yearly' },
+      { tf: 60, name: '1H', structure: 'yearly' },
+      { tf: 15, name: '15M', structure: 'monthly' },
+      { tf: 5, name: '5M', structure: 'monthly' },
+      { tf: 1, name: '1M', structure: 'monthly' },
+    ],
   },
 ];
-
-// Mapeia timeframe para nome legível
-function timeframeName(tf: Timeframe): string {
-  const names: Record<string, string> = {
-    '1M': 'Mensal',
-    '1W': 'Semanal',
-    '1D': 'Diario',
-    '240': '4H',
-    '60': '1H',
-    '30': '30M',
-    '15': '15M',
-    '5': '5M',
-    '3': '3M',
-    '1': '1M',
-  };
-  return names[String(tf)] || String(tf);
-}
 
 // Configuração do Drive
 function getDriveConfig() {
@@ -72,93 +72,229 @@ function getDriveConfig() {
   };
 }
 
-// Nome do arquivo no Drive
-function getFileName(symbolName: string, tf: Timeframe): string {
-  return `${symbolName}_${timeframeName(tf)}.json`;
+/**
+ * Agrupa candles por ano
+ */
+function groupByYear(candles: Candle[]): Map<number, Candle[]> {
+  const groups = new Map<number, Candle[]>();
+  for (const c of candles) {
+    const year = new Date(c.timestamp * 1000).getFullYear();
+    if (!groups.has(year)) groups.set(year, []);
+    groups.get(year)!.push(c);
+  }
+  return groups;
 }
 
 /**
- * Mescla candles antigos com novos, evitando duplicatas
+ * Agrupa candles por ano/mês
  */
-function mergeCandles(oldCandles: Candle[], newCandles: Candle[]): Candle[] {
-  const byTimestamp = new Map<number, Candle>();
-  
-  // Adiciona antigos
-  for (const c of oldCandles) {
-    byTimestamp.set(c.timestamp, c);
+function groupByMonth(candles: Candle[]): Map<string, Candle[]> {
+  const groups = new Map<string, Candle[]>();
+  for (const c of candles) {
+    const d = new Date(c.timestamp * 1000);
+    const key = `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(c);
   }
-  
-  // Sobrescreve/adiciona novos (mais recentes têm prioridade)
-  for (const c of newCandles) {
-    byTimestamp.set(c.timestamp, c);
-  }
-  
-  // Ordena por timestamp
-  return Array.from(byTimestamp.values()).sort((a, b) => a.timestamp - b.timestamp);
+  return groups;
 }
 
 /**
- * Atualiza dados de um símbolo/timeframe
+ * Mescla candles
  */
-async function updateSymbolTimeframe(
+function mergeCandles(old: Candle[], newer: Candle[]): Candle[] {
+  const map = new Map<number, Candle>();
+  for (const c of old) map.set(c.timestamp, c);
+  for (const c of newer) map.set(c.timestamp, c);
+  return Array.from(map.values()).sort((a, b) => a.timestamp - b.timestamp);
+}
+
+/**
+ * Atualiza timeframe com estrutura SINGLE (um arquivo só)
+ */
+async function updateSingle(
   connection: Awaited<ReturnType<typeof connect>>,
-  config: SymbolConfig,
-  tf: Timeframe,
+  symbol: string,
+  tfConfig: TimeframeConfig,
   driveConfig: ReturnType<typeof getDriveConfig>,
   symbolFolderId: string
-): Promise<{ updated: boolean; count: number }> {
-  const fileName = getFileName(config.name, tf);
+): Promise<number> {
+  const fileName = `${tfConfig.name}.json`;
+  console.log(`  📥 ${tfConfig.name}...`);
   
-  console.log(`  📥 ${timeframeName(tf)}...`);
-  
+  // Baixar existente
+  let existing: DataFile | null = null;
   try {
-    // Baixar dados existentes do Drive
-    let existingData: DataFile | null = null;
+    existing = await downloadJson<DataFile>(driveConfig, fileName, symbolFolderId);
+  } catch {}
+  
+  // Buscar novos dados
+  const newCandles = await getCandles({
+    connection,
+    symbol,
+    timeframe: tfConfig.tf,
+    amount: existing ? 500 : 10000,
+  });
+  
+  if (newCandles.length === 0) {
+    console.log(`    ⚠️ Sem dados`);
+    return 0;
+  }
+  
+  const merged = mergeCandles(existing?.candles || [], newCandles);
+  
+  await uploadJson(driveConfig, fileName, {
+    symbol,
+    timeframe: tfConfig.name,
+    candles: merged,
+    lastUpdate: new Date().toISOString(),
+    totalCandles: merged.length,
+  }, symbolFolderId);
+  
+  console.log(`    ✅ ${merged.length} candles`);
+  return merged.length;
+}
+
+/**
+ * Atualiza timeframe com estrutura YEARLY (pasta + ano.json)
+ */
+async function updateYearly(
+  connection: Awaited<ReturnType<typeof connect>>,
+  symbol: string,
+  tfConfig: TimeframeConfig,
+  driveConfig: ReturnType<typeof getDriveConfig>,
+  symbolFolderId: string
+): Promise<number> {
+  console.log(`  📥 ${tfConfig.name}/...`);
+  
+  // Criar pasta do timeframe
+  const tfFolderId = await findOrCreateFolder({ ...driveConfig, folderId: symbolFolderId }, tfConfig.name);
+  
+  // Buscar dados
+  const candles = await getCandles({
+    connection,
+    symbol,
+    timeframe: tfConfig.tf,
+    amount: 10000,
+  });
+  
+  if (candles.length === 0) {
+    console.log(`    ⚠️ Sem dados`);
+    return 0;
+  }
+  
+  // Agrupar por ano
+  const byYear = groupByYear(candles);
+  let total = 0;
+  
+  for (const [year, yearCandles] of byYear) {
+    const fileName = `${year}.json`;
+    
+    // Baixar existente e mesclar
+    let existing: DataFile | null = null;
     try {
-      existingData = await downloadJson<DataFile>(driveConfig, fileName, symbolFolderId);
-    } catch {
-      // Arquivo pode não existir ainda
-    }
+      existing = await downloadJson<DataFile>(driveConfig, fileName, tfFolderId);
+    } catch {}
     
-    // Buscar novos dados do TradingView
-    // Se já tem dados, busca menos (apenas atualização)
-    const amount = existingData ? 500 : 10000;
+    const merged = mergeCandles(existing?.candles || [], yearCandles);
     
-    const newCandles = await getCandles({
-      connection,
-      symbol: config.symbol,
-      timeframe: tf,
-      amount,
-    });
-    
-    if (newCandles.length === 0) {
-      console.log(`    ⚠️ Nenhum dado retornado`);
-      return { updated: false, count: 0 };
-    }
-    
-    // Mesclar dados
-    const oldCandles = existingData?.candles || [];
-    const merged = mergeCandles(oldCandles, newCandles);
-    
-    const dataFile: DataFile = {
-      symbol: config.symbol,
-      timeframe: String(tf),
+    await uploadJson(driveConfig, fileName, {
+      symbol,
+      timeframe: tfConfig.name,
+      period: String(year),
       candles: merged,
       lastUpdate: new Date().toISOString(),
       totalCandles: merged.length,
-    };
+    }, tfFolderId);
     
-    // Upload para o Drive
-    await uploadJson(driveConfig, fileName, dataFile, symbolFolderId);
-    
-    const newCount = merged.length - oldCandles.length;
-    console.log(`    ✅ ${merged.length} candles (${newCount > 0 ? `+${newCount} novos` : 'atualizado'})`);
-    
-    return { updated: true, count: merged.length };
-  } catch (error) {
-    console.error(`    ❌ Erro: ${error}`);
-    return { updated: false, count: 0 };
+    total += merged.length;
   }
+  
+  // Criar/atualizar index.json
+  const years = Array.from(byYear.keys()).sort();
+  await uploadJson(driveConfig, 'index.json', {
+    symbol,
+    timeframe: tfConfig.name,
+    years,
+    lastUpdate: new Date().toISOString(),
+  }, tfFolderId);
+  
+  console.log(`    ✅ ${total} candles em ${years.length} anos`);
+  return total;
+}
+
+/**
+ * Atualiza timeframe com estrutura MONTHLY (pasta/ano/mes.json)
+ */
+async function updateMonthly(
+  connection: Awaited<ReturnType<typeof connect>>,
+  symbol: string,
+  tfConfig: TimeframeConfig,
+  driveConfig: ReturnType<typeof getDriveConfig>,
+  symbolFolderId: string
+): Promise<number> {
+  console.log(`  📥 ${tfConfig.name}/...`);
+  
+  // Criar pasta do timeframe
+  const tfFolderId = await findOrCreateFolder({ ...driveConfig, folderId: symbolFolderId }, tfConfig.name);
+  
+  // Buscar dados
+  const candles = await getCandles({
+    connection,
+    symbol,
+    timeframe: tfConfig.tf,
+    amount: 10000,
+  });
+  
+  if (candles.length === 0) {
+    console.log(`    ⚠️ Sem dados`);
+    return 0;
+  }
+  
+  // Agrupar por ano/mês
+  const byMonth = groupByMonth(candles);
+  let total = 0;
+  const years = new Set<number>();
+  
+  for (const [yearMonth, monthCandles] of byMonth) {
+    const [year, month] = yearMonth.split('/');
+    years.add(parseInt(year));
+    
+    // Criar pasta do ano
+    const yearFolderId = await findOrCreateFolder({ ...driveConfig, folderId: tfFolderId }, year);
+    
+    const fileName = `${month}.json`;
+    
+    // Baixar existente e mesclar
+    let existing: DataFile | null = null;
+    try {
+      existing = await downloadJson<DataFile>(driveConfig, fileName, yearFolderId);
+    } catch {}
+    
+    const merged = mergeCandles(existing?.candles || [], monthCandles);
+    
+    await uploadJson(driveConfig, fileName, {
+      symbol,
+      timeframe: tfConfig.name,
+      period: yearMonth,
+      candles: merged,
+      lastUpdate: new Date().toISOString(),
+      totalCandles: merged.length,
+    }, yearFolderId);
+    
+    total += merged.length;
+  }
+  
+  // Criar/atualizar index.json
+  await uploadJson(driveConfig, 'index.json', {
+    symbol,
+    timeframe: tfConfig.name,
+    years: Array.from(years).sort(),
+    lastUpdate: new Date().toISOString(),
+  }, tfFolderId);
+  
+  console.log(`    ✅ ${total} candles em ${byMonth.size} meses`);
+  return total;
 }
 
 /**
@@ -167,7 +303,7 @@ async function updateSymbolTimeframe(
 async function runUpdate() {
   console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
-║           ScrapperTV - Atualização Automática                 ║
+║           ScrapperTV - Atualização Hierárquica                ║
 ╚═══════════════════════════════════════════════════════════════╝
 📅 ${new Date().toISOString()}
 `);
@@ -176,83 +312,51 @@ async function runUpdate() {
   const sessionId = process.env.TV_SESSION_ID;
   
   if (!sessionId) {
-    console.warn('⚠️ TV_SESSION_ID não configurado. Usando conta gratuita.');
+    console.warn('⚠️ TV_SESSION_ID não configurado.');
   }
   
-  // Conectar ao TradingView
   console.log('🔗 Conectando ao TradingView...');
   const connection = await connect({ sessionId });
   console.log('✅ Conectado!\n');
   
-  const results: { symbol: string; timeframe: string; count: number }[] = [];
-  
   for (const config of SYMBOLS) {
-    console.log(`\n📊 ${config.name} (${config.symbol})`);
+    console.log(`\n📊 ${config.driveFolderName}`);
     
-    // Criar/encontrar pasta do símbolo no Drive
-    let symbolFolderId: string;
-    try {
-      symbolFolderId = await findOrCreateFolder(driveConfig, config.name);
-    } catch (error) {
-      console.error(`  ❌ Erro ao criar pasta: ${error}`);
-      continue;
-    }
+    // Criar pasta do símbolo
+    const symbolFolderId = await findOrCreateFolder(driveConfig, config.driveFolderName);
     
-    for (const tf of config.timeframes) {
-      const result = await updateSymbolTimeframe(connection, config, tf, driveConfig, symbolFolderId);
-      if (result.updated) {
-        results.push({
-          symbol: config.name,
-          timeframe: timeframeName(tf),
-          count: result.count,
-        });
+    for (const tfConfig of config.timeframes) {
+      try {
+        switch (tfConfig.structure) {
+          case 'single':
+            await updateSingle(connection, config.symbol, tfConfig, driveConfig, symbolFolderId);
+            break;
+          case 'yearly':
+            await updateYearly(connection, config.symbol, tfConfig, driveConfig, symbolFolderId);
+            break;
+          case 'monthly':
+            await updateMonthly(connection, config.symbol, tfConfig, driveConfig, symbolFolderId);
+            break;
+        }
+      } catch (error) {
+        console.error(`    ❌ Erro: ${error}`);
       }
       
-      // Pequeno delay entre requests
       await new Promise(r => setTimeout(r, 500));
     }
   }
   
-  // Fechar conexão
   await connection.close();
-  
-  // Resumo
-  console.log(`
-╔═══════════════════════════════════════════════════════════════╗
-║                        RESUMO                                 ║
-╚═══════════════════════════════════════════════════════════════╝
-`);
-  
-  if (results.length === 0) {
-    console.log('⚠️ Nenhum arquivo atualizado.');
-  } else {
-    console.log(`✅ ${results.length} arquivos atualizados:\n`);
-    for (const r of results) {
-      console.log(`  📄 ${r.symbol}/${r.timeframe}: ${r.count} candles`);
-    }
-  }
-  
   console.log('\n✅ Atualização concluída!');
 }
 
 // CLI
 async function main() {
-  const args = process.argv.slice(2);
-  
-  if (args.includes('--help') || args.includes('-h')) {
+  if (process.argv.includes('--help')) {
     console.log(`
-USAGE:
-  npx tsx src/updater.ts [options]
+USAGE: npx tsx src/updater.ts
 
-OPTIONS:
-  --help, -h    Mostra esta ajuda
-  --dry-run     Simula execução sem fazer upload
-
-ENVIRONMENT:
-  TV_SESSION_ID           SessionId do TradingView (opcional)
-  GOOGLE_CREDENTIALS      JSON das credenciais Google (para CI)
-  GOOGLE_CREDENTIALS_PATH Caminho para arquivo de credenciais
-  GOOGLE_FOLDER_ID        ID da pasta no Drive
+Atualiza dados do TradingView para o Google Drive com estrutura hierárquica.
 `);
     return;
   }
