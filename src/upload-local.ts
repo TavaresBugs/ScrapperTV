@@ -125,7 +125,6 @@ async function uploadTimeframeFolder(
 ): Promise<number> {
   const entries = await readdir(localFolder, { withFileTypes: true });
   let count = 0;
-  const trackedYears: number[] = [];
   
   for (const entry of entries) {
     const localPath = join(localFolder, entry.name);
@@ -134,41 +133,40 @@ async function uploadTimeframeFolder(
       // É uma pasta de ano (2024, 2025, etc)
       const year = parseInt(entry.name);
       if (!isNaN(year)) {
-        trackedYears.push(year);
         console.log(`    📁 ${entry.name}/`);
         
         // Criar pasta do ano no Drive
         const yearFolderId = await findOrCreateFolder({ ...driveConfig, folderId: driveFolderId }, entry.name);
         
-        // Processar arquivos de mês
+        // Processar arquivos de mês em lotes para maior velocidade
         const monthFiles = await readdir(localPath, { withFileTypes: true });
-        for (const monthFile of monthFiles.filter(f => f.name.endsWith('.json') && f.name !== 'index.json')) {
-          await uploadLocalFile(join(localPath, monthFile.name), yearFolderId, monthFile.name, driveConfig);
-          count++;
+        const jsonFiles = monthFiles.filter(f => f.name.endsWith('.json') && f.name !== 'index.json');
+        
+        // Processar em lotes de 5 arquivos simultâneos
+        const BATCH_SIZE = 5;
+        for (let i = 0; i < jsonFiles.length; i += BATCH_SIZE) {
+          const batch = jsonFiles.slice(i, i + BATCH_SIZE);
+          await Promise.all(batch.map(async (monthFile) => {
+            await uploadLocalFile(join(localPath, monthFile.name), yearFolderId, monthFile.name, driveConfig);
+            count++;
+          }));
         }
       }
     } else if (entry.name.endsWith('.json') && entry.name !== 'index.json') {
       // Arquivo de ano direto (para 4H, 1H) ou arquivo único
+      // Adicionar à lista para processamento em lote posterior (no nível superior do loop) ou processar aqui se for pouco
       await uploadLocalFile(localPath, driveFolderId, entry.name, driveConfig);
       count++;
-      
-      // Se for 2024.json, extrai o ano
-      const year = parseInt(entry.name.replace('.json', ''));
-      if (!isNaN(year) && year > 1990 && year < 2100) {
-        trackedYears.push(year);
-      }
     }
   }
   
-  // Atualizar index.json com os anos encontrados
-  if (trackedYears.length > 0) {
-    const sortedYears = [...new Set(trackedYears)].sort();
-    await uploadJson(driveConfig, 'index.json', {
-      timeframe: timeframeName,
-      years: sortedYears,
-      lastUpdate: new Date().toISOString(),
-    }, driveFolderId);
-    console.log(`    📋 index.json atualizado: ${sortedYears.join(', ')}`);
+  // Upload do index.json local se existir
+  const localIndexPath = join(localFolder, 'index.json');
+  if (existsSync(localIndexPath)) {
+    const localIndex = await readFile(localIndexPath, 'utf-8');
+    const indexData = JSON.parse(localIndex);
+    await uploadJson(driveConfig, 'index.json', indexData, driveFolderId);
+    console.log(`    📋 index.json enviado (formato original)`);
   }
   
   return count;
