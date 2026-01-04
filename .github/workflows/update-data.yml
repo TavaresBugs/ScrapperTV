@@ -1,0 +1,49 @@
+name: Update TradingView Data
+
+on:
+  # Executa diariamente às 6h UTC (3h BRT)
+  schedule:
+    - cron: "0 6 * * *"
+
+  # Permite execução manual
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Símbolos para atualizar (vazio = todos)"
+        required: false
+        default: ""
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TypeScript
+        run: npm run build
+
+      - name: Run data update
+        env:
+          TV_SESSION_ID: ${{ secrets.TV_SESSION_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          GOOGLE_FOLDER_ID: ${{ secrets.GOOGLE_FOLDER_ID }}
+        run: npx tsx src/updater.ts
+
+      - name: Report status
+        if: always()
+        run: |
+          echo "## Data Update Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY

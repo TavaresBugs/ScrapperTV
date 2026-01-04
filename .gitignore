@@ -7,3 +7,6 @@ data/
 # Google Cloud credentials (NEVER commit these!)
 scrappertv-*.json
 *.credentials.json
+
+# Draft files for Drive upload
+drafts/
