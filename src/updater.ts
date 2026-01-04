@@ -58,6 +58,7 @@ const SYMBOLS: SymbolConfig[] = [
       { tf: 60, name: '1H', structure: 'yearly' },
       { tf: 15, name: '15M', structure: 'monthly' },
       { tf: 5, name: '5M', structure: 'monthly' },
+      { tf: 3, name: '3M', structure: 'monthly' },
       { tf: 1, name: '1M', structure: 'monthly' },
     ],
   },
