@@ -3,3 +3,7 @@ dist/
 data/
 *.log
 .env
+
+# Google Cloud credentials (NEVER commit these!)
+scrappertv-*.json
+*.credentials.json

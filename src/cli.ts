@@ -70,8 +70,8 @@ function parseArgs(): CliOptions {
   }
 
   // Verificar variável de ambiente
-  if (!options.sessionId && process.env.TRADINGVIEW_SESSION_ID) {
-    options.sessionId = process.env.TRADINGVIEW_SESSION_ID;
+  if (!options.sessionId && process.env.TV_SESSION_ID) {
+    options.sessionId = process.env.TV_SESSION_ID;
   }
 
   return options;
